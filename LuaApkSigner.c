@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <lua.h>
 #include <lauxlib.h>
@@ -16,7 +17,7 @@
 #include <openssl/err.h>
 
 #define PATH_MAX 4096
-#define LINE_MAX 70 // MANIFEST.MF 行的最大长度
+#define _LINE_MAX 70 // MANIFEST.MF 行的最大长度
 
 // 用于存储 MANIFEST.MF 条目和完整数据块
 typedef struct {
@@ -30,6 +31,7 @@ typedef struct {
     ManifestEntry *entries;
     size_t count;
     size_t capacity;
+    char *digest_manifest;
 } ManifestEntries;
 
 // 初始化动态数组
@@ -228,35 +230,59 @@ int copy_apk_contents(zip_t *apk_in, zip_t *apk_out) {
 }
 
 // 写入带有行长度限制的行，并进行换行
-int write_wrapped_line(FILE *f, const char *prefix, const char *content) {
+int write_wrapped_line_to_buffer(FILE *f, char **buffer, size_t *buffer_len, const char *prefix, const char *content) {
     size_t prefix_len = strlen(prefix);
     size_t content_len = strlen(content);
     size_t total_len = prefix_len + content_len;
+    char *line = (char *)malloc(total_len + 1);
+    if (!line) return -1;
 
-    size_t max_content_per_line = LINE_MAX - prefix_len;
+    strcpy(line, prefix);
+    strcat(line, content);
 
-    if (max_content_per_line <= 0) {
-        return -1;
-    }
+    size_t line_len = strlen(line);
+    size_t pos = 0;
 
-    size_t written = 0;
-    while (written < content_len) {
-        size_t to_write = content_len - written;
-        if (to_write > max_content_per_line) {
-            to_write = max_content_per_line;
-        }
+    size_t buf_size = 0;
+    char *buf = NULL;
 
-        if (written == 0) {
-            fwrite(prefix, 1, prefix_len, f);
+    while (pos < line_len) {
+        size_t current_max = (pos == 0) ? _LINE_MAX : (_LINE_MAX - 1);
+        size_t remaining = line_len - pos;
+        size_t chunk_len = (remaining > current_max) ? current_max : remaining;
+
+        char temp_line[_LINE_MAX + 3];
+        size_t temp_line_len = 0;
+
+        if (pos > 0) {
+            temp_line[0] = ' ';
+            memcpy(temp_line + 1, line + pos, chunk_len);
+            temp_line_len = chunk_len + 1;
         } else {
-            fwrite(" ", 1, 1, f);
+            memcpy(temp_line, line + pos, chunk_len);
+            temp_line_len = chunk_len;
         }
 
-        fwrite(content + written, 1, to_write, f);
-        fwrite("\r\n", 1, 2, f);
+        pos += chunk_len;
 
-        written += to_write;
+        temp_line[temp_line_len++] = '\r';
+        temp_line[temp_line_len++] = '\n';
+
+        fwrite(temp_line, 1, temp_line_len, f);
+
+        buf = (char *)realloc(buf, buf_size + temp_line_len);
+        if (!buf) {
+            free(line);
+            return -1;
+        }
+        memcpy(buf + buf_size, temp_line, temp_line_len);
+        buf_size += temp_line_len;
     }
+
+    free(line);
+
+    *buffer = buf;
+    *buffer_len = buf_size;
 
     return 0;
 }
@@ -279,10 +305,52 @@ int generate_manifest(const char *apk_path, const char *manifest_path, ManifestE
         return 0;
     }
 
+    char *header_content = NULL;
+    size_t header_content_len = 0;
+
     // 写入文件头部
-    fprintf(manifest_file, "Manifest-Version: 1.0\r\n");
-    fprintf(manifest_file, "Created-By: 1.0 (Android SignApk)\r\n");
-    fprintf(manifest_file, "\r\n");
+    char *temp_buffer = NULL;
+    size_t temp_buffer_len = 0;
+
+    // 写入 "Manifest-Version: 1.0\r\n"
+    if (write_wrapped_line_to_buffer(manifest_file, &temp_buffer, &temp_buffer_len, "Manifest-Version: ", "1.0") != 0) {
+        fprintf(stderr, "无法写入文件头部\n");
+        zip_close(apk);
+        fclose(manifest_file);
+        return 0;
+    }
+    header_content = temp_buffer;
+    header_content_len = temp_buffer_len;
+
+    // 写入 "Created-By: 1.0 (Android SignApk)\r\n"
+    temp_buffer = NULL;
+    temp_buffer_len = 0;
+    if (write_wrapped_line_to_buffer(manifest_file, &temp_buffer, &temp_buffer_len, "Created-By: ", "1.0 (Android SignApk)") != 0) {
+        fprintf(stderr, "无法写入文件头部\n");
+        zip_close(apk);
+        fclose(manifest_file);
+        free(header_content);
+        return 0;
+    }
+    header_content = (char *)realloc(header_content, header_content_len + temp_buffer_len);
+    memcpy(header_content + header_content_len, temp_buffer, temp_buffer_len);
+    header_content_len += temp_buffer_len;
+    free(temp_buffer);
+
+    // 写入空行
+    fwrite("\r\n", 1, 2, manifest_file);
+    header_content = (char *)realloc(header_content, header_content_len + 2);
+    memcpy(header_content + header_content_len, "\r\n", 2);
+    header_content_len += 2;
+
+    // 在内存中构建 MANIFEST.MF 内容，包括文件头部
+    unsigned char *manifest_content = NULL;
+    size_t manifest_content_len = 0;
+
+    manifest_content = (unsigned char *)malloc(header_content_len);
+    memcpy(manifest_content, header_content, header_content_len);
+    manifest_content_len = header_content_len;
+    free(header_content);
 
     for (zip_int64_t i = 0; i < num_entries; i++) {
         const char *name = zip_get_name(apk, i, 0);
@@ -305,49 +373,78 @@ int generate_manifest(const char *apk_path, const char *manifest_path, ManifestE
             continue;
         }
 
-        // 构建完整的数据块
-        // Name: [name]\r\nSHA1-Digest: [digest]\r\n\r\n
-        size_t data_block_len = strlen("Name: ") + strlen(name) + strlen("\r\nSHA1-Digest: ") + strlen(digest) + strlen("\r\n\r\n") + 1;
-        char *data_block = (char *)malloc(data_block_len);
-        if (!data_block) {
-            fprintf(stderr, "内存分配失败: %s\n", name);
-            free(digest);
-            continue;
-        }
-        snprintf(data_block, data_block_len, "Name: %s\r\nSHA1-Digest: %s\r\n\r\n", name, digest);
+        char *entry_content = NULL;
+        size_t entry_content_len = 0;
 
-        // 写入 MANIFEST.MF，处理行长度限制
-        if (write_wrapped_line(manifest_file, "Name: ", name) != 0) {
+        // 写入 Name 行
+        if (write_wrapped_line_to_buffer(manifest_file, &entry_content, &entry_content_len, "Name: ", name) != 0) {
             fprintf(stderr, "无法写入Name: %s\n", name);
             free(digest);
-            free(data_block);
             continue;
         }
 
-        if (write_wrapped_line(manifest_file, "SHA1-Digest: ", digest) != 0) {
+        // 写入 SHA1-Digest 行
+        char *digest_content = NULL;
+        size_t digest_content_len = 0;
+        if (write_wrapped_line_to_buffer(manifest_file, &digest_content, &digest_content_len, "SHA1-Digest: ", digest) != 0) {
             fprintf(stderr, "无法写入SHA1-Digest: %s\n", name);
             free(digest);
-            free(data_block);
+            free(entry_content);
             continue;
         }
 
         // 写入空行
         fwrite("\r\n", 1, 2, manifest_file);
 
+        // 在 entry_content 和 digest_content 之后添加空行
+        char *data_block = (char *)malloc(entry_content_len + digest_content_len + 2);
+        if (!data_block) {
+            fprintf(stderr, "内存分配失败: %s\n", name);
+            free(digest);
+            free(entry_content);
+            free(digest_content);
+            continue;
+        }
+        memcpy(data_block, entry_content, entry_content_len);
+        memcpy(data_block + entry_content_len, digest_content, digest_content_len);
+        memcpy(data_block + entry_content_len + digest_content_len, "\r\n", 2);
+        size_t data_block_len = entry_content_len + digest_content_len + 2;
+
+        // 将 data_block 添加到 manifest_content
+        manifest_content = (unsigned char *)realloc(manifest_content, manifest_content_len + data_block_len);
+        memcpy(manifest_content + manifest_content_len, data_block, data_block_len);
+        manifest_content_len += data_block_len;
+
         // 添加到 ManifestEntries
         if (!add_manifest_entry(me, name, digest, data_block)) {
             fprintf(stderr, "无法添加Manifest条目: %s\n", name);
             free(digest);
+            free(entry_content);
+            free(digest_content);
             free(data_block);
             continue;
         }
 
         free(digest);
+        free(entry_content);
+        free(digest_content);
         free(data_block);
     }
 
     fclose(manifest_file);
     zip_close(apk);
+
+    // 计算 SHA1-Digest-Manifest
+    char *digest_manifest = sha1_base64(manifest_content, manifest_content_len);
+    if (!digest_manifest) {
+        fprintf(stderr, "无法计算 MANIFEST.MF 的 SHA1 摘要\n");
+        free(manifest_content);
+        return 0;
+    }
+
+    me->digest_manifest = digest_manifest;
+
+    free(manifest_content);
 
     return 1;
 }
@@ -358,59 +455,71 @@ int generate_cert_sf(const char *cert_sf_path, const ManifestEntries *me) {
     // MANIFEST.MF 的内容已写入文件，需计算 MANIFEST.MF 中的条目的对应的文件的摘要
     // 为避免不一致，计算摘要时使用内存中的数据块
 
-    // 计算 MANIFEST.MF 的总大小
-    size_t total_size = 0;
-    for (size_t i = 0; i < me->count; i++) {
-        total_size += strlen(me->entries[i].data_block);
-    }
-
-    // 添加文件头部: "Manifest-Version: 1.0\r\nCreated-By: 1.0 (Android SignApk)\r\n\r\n"
-    total_size += strlen("Manifest-Version: 1.0\r\nCreated-By: 1.0 (Android SignApk)\r\n\r\n");
-
-    unsigned char *manifest_content = (unsigned char *)malloc(total_size);
-    if (!manifest_content) {
-        fprintf(stderr, "内存分配失败\n");
-        return 0;
-    }
-
-    // 在内存中构建 MANIFEST.MF 内容
-    size_t offset = 0;
-    strcpy((char *)(manifest_content + offset), "Manifest-Version: 1.0\r\n");
-    offset += strlen("Manifest-Version: 1.0\r\n");
-    strcpy((char *)(manifest_content + offset), "Created-By: 1.0 (Android SignApk)\r\n");
-    offset += strlen("Created-By: 1.0 (Android SignApk)\r\n");
-    strcpy((char *)(manifest_content + offset), "\r\n");
-    offset += strlen("\r\n");
-
-    for (size_t i = 0; i < me->count; i++) {
-        size_t len = strlen(me->entries[i].data_block);
-        memcpy(manifest_content + offset, me->entries[i].data_block, len);
-        offset += len;
-    }
-
-    // 计算 SHA1-Digest-Manifest
-    char *digest_manifest = sha1_base64(manifest_content, total_size);
-    free(manifest_content);
-    if (!digest_manifest) {
-        fprintf(stderr, "无法计算 MANIFEST.MF 的 SHA1 摘要\n");
-        return 0;
-    }
-
     // 创建 CERT.SF 内容
     FILE *cert_sf_file = fopen(cert_sf_path, "wb");
     if (!cert_sf_file) {
-        free(digest_manifest);
         fprintf(stderr, "无法创建 CERT.SF 文件: %s\n", cert_sf_path);
         return 0;
     }
 
-    // 写入文件头部
-    fprintf(cert_sf_file, "Signature-Version: 1.0\r\n");
-    fprintf(cert_sf_file, "Created-By: 1.0 (Android SignApk)\r\n");
-    fprintf(cert_sf_file, "SHA1-Digest-Manifest: %s\r\n", digest_manifest);
-    fprintf(cert_sf_file, "\r\n");
+    unsigned char *cert_sf_content = NULL;
+    size_t cert_sf_content_len = 0;
 
-    free(digest_manifest);
+    // 写入文件头部
+    char *temp_buffer = NULL;
+    size_t temp_buffer_len = 0;
+
+    // 写入 "Manifest-Version: 1.0\r\n"
+    if (write_wrapped_line_to_buffer(cert_sf_file, &temp_buffer, &temp_buffer_len, "Manifest-Version: ", "1.0") != 0) {
+        fprintf(stderr, "无法写入 CERT.SF 文件头部\n");
+        fclose(cert_sf_file);
+        return 0;
+    }
+    cert_sf_content = (unsigned char *)malloc(temp_buffer_len);
+    if (!cert_sf_content) {
+        fprintf(stderr, "内存分配失败\n");
+        fclose(cert_sf_file);
+        free(temp_buffer);
+        return 0;
+    }
+    memcpy(cert_sf_content, temp_buffer, temp_buffer_len);
+    cert_sf_content_len = temp_buffer_len;
+    free(temp_buffer);
+
+    temp_buffer = NULL;
+    temp_buffer_len = 0;
+
+    // 写入 "Created-By: 1.0 (Android SignApk)\r\n"
+    if (write_wrapped_line_to_buffer(cert_sf_file, &temp_buffer, &temp_buffer_len, "Created-By: ", "1.0 (Android SignApk)") != 0) {
+        fprintf(stderr, "无法写入 CERT.SF 文件头部\n");
+        fclose(cert_sf_file);
+        free(cert_sf_content);
+        return 0;
+    }
+    cert_sf_content = (unsigned char *)realloc(cert_sf_content, cert_sf_content_len + temp_buffer_len);
+    memcpy(cert_sf_content + cert_sf_content_len, temp_buffer, temp_buffer_len);
+    cert_sf_content_len += temp_buffer_len;
+    free(temp_buffer);
+
+    temp_buffer = NULL;
+    temp_buffer_len = 0;
+
+    // 写入 "SHA1-Digest-Manifest: [digest]\r\n\r\n"
+    if (write_wrapped_line_to_buffer(cert_sf_file, &temp_buffer, &temp_buffer_len, "SHA1-Digest-Manifest: ", me->digest_manifest) != 0) {
+        fprintf(stderr, "无法写入 SHA1-Digest-Manifest\n");
+        fclose(cert_sf_file);
+        free(cert_sf_content);
+        return 0;
+    }
+    cert_sf_content = (unsigned char *)realloc(cert_sf_content, cert_sf_content_len + temp_buffer_len);
+    memcpy(cert_sf_content + cert_sf_content_len, temp_buffer, temp_buffer_len);
+    cert_sf_content_len += temp_buffer_len;
+    free(temp_buffer);
+
+    fwrite("\r\n", 1, 2, cert_sf_file);
+    cert_sf_content = (unsigned char *)realloc(cert_sf_content, cert_sf_content_len + 2);
+    memcpy(cert_sf_content + cert_sf_content_len, "\r\n", 2);
+    cert_sf_content_len += 2;
 
     // 解析 ManifestEntries，逐个条目计算摘要并写入 CERT.SF
     for (size_t i = 0; i < me->count; i++) {
@@ -425,25 +534,42 @@ int generate_cert_sf(const char *cert_sf_path, const ManifestEntries *me) {
         }
 
         // 写入 CERT.SF 条目，处理行长度限制
-        if (write_wrapped_line(cert_sf_file, "Name: ", name) != 0) {
+        char *entry_content = NULL;
+        size_t entry_content_len = 0;
+        if (write_wrapped_line_to_buffer(cert_sf_file, &entry_content, &entry_content_len, "Name: ", name) != 0) {
             fprintf(stderr, "无法在 CERT.SF 中写入Name: %s\n", name);
             free(entry_digest);
             continue;
         }
 
-        if (write_wrapped_line(cert_sf_file, "SHA1-Digest: ", entry_digest) != 0) {
+        char *digest_content = NULL;
+        size_t digest_content_len = 0;
+
+        // 写入 "SHA1-Digest-Manifest: [digest]\r\n\r\n"
+        if (write_wrapped_line_to_buffer(cert_sf_file, &digest_content, &digest_content_len, "SHA1-Digest: ", entry_digest) != 0) {
             fprintf(stderr, "无法在 CERT.SF 中写入 %s 的 SHA1-Digest\n", name);
             free(entry_digest);
+            free(entry_content);
             continue;
         }
 
-        // 写入空行
         fwrite("\r\n", 1, 2, cert_sf_file);
 
+        size_t total_entry_len = entry_content_len + digest_content_len + 2;
+        cert_sf_content = (unsigned char *)realloc(cert_sf_content, cert_sf_content_len + total_entry_len);
+        memcpy(cert_sf_content + cert_sf_content_len, entry_content, entry_content_len);
+        memcpy(cert_sf_content + cert_sf_content_len + entry_content_len, digest_content, digest_content_len);
+        memcpy(cert_sf_content + cert_sf_content_len + entry_content_len + digest_content_len, "\r\n", 2);
+        cert_sf_content_len += total_entry_len;
+
         free(entry_digest);
+        free(entry_content);
+        free(digest_content);
     }
 
     fclose(cert_sf_file);
+
+    free(cert_sf_content);
 
     return 1;
 }
